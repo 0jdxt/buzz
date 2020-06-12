@@ -1,4 +1,4 @@
-#![warn(rust_2018_idioms)]
+#![warn(clippy::all, clippy::pedantic, rust_2018_idioms)]
 
 use native_tls::{TlsConnector, TlsStream};
 use rayon::prelude::*;
@@ -17,6 +17,7 @@ use std::time::Duration;
 struct Account {
     name: String,
     server: (String, u16),
+    starttls: bool,
     username: String,
     password: String,
     notification_command: Option<String>,
@@ -24,26 +25,38 @@ struct Account {
 
 impl Account {
     pub fn connect(&self) -> Result<Connection<TlsStream<TcpStream>>, imap::error::Error> {
-        let tls = TlsConnector::builder().build()?;
-        imap::connect((&*self.server.0, self.server.1), &self.server.0, &tls).and_then(|c| {
-            let mut c = c
-                .login(self.username.trim(), self.password.trim())
-                .map_err(|(e, _)| e)?;
-            let cap = c.capabilities()?;
-            if !cap.has_str("IDLE") {
-                return Err(imap::error::Error::Bad(
-                    cap.iter()
-                        .map(|s| format!("{:?}", s))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ));
-            }
-            c.select("INBOX")?;
+        // allow self signed certs for localhost
+        let tls = match &self.server.0[..] {
+            "localhost" | "127.0.0.1" => TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build(),
+            _ => TlsConnector::builder().build(),
+        }?;
+
+        // connect and login
+        let mut client = if self.starttls {
+            imap::connect_starttls((&*self.server.0, self.server.1), &self.server.0, &tls)
+        } else {
+            imap::connect((&*self.server.0, self.server.1), &self.server.0, &tls)
+        }?
+        .login(self.username.trim(), self.password.trim())
+        .map_err(|(e, _)| e)?;
+
+        let cap = client.capabilities()?;
+        if cap.has_str("IDLE") {
+            client.select("INBOX")?;
             Ok(Connection {
                 account: self.clone(),
-                socket: c,
+                socket: client,
             })
-        })
+        } else {
+            Err(imap::error::Error::Bad(
+                cap.iter()
+                    .map(|s| format!("{:?}", s))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ))
+        }
     }
 }
 
@@ -128,13 +141,18 @@ impl<T: Read + Write + imap::extensions::idle::SetReadTimeout> Connection<T> {
                             };
 
                             let date = match headers.get_first_value("Date") {
-                                Some(date) => match chrono::DateTime::parse_from_rfc2822(&date) {
+                                Some(date) => match chrono::DateTime::parse_from_rfc2822(
+                                    // strip explicit time zone from end of string
+                                    // e.g. Mon, 1 Jan 1970 00:00:00 +0000 (GMT)
+                                    date.split('(').next().unwrap().trim(),
+                                ) {
                                     Ok(date) => date.with_timezone(&chrono::Local),
                                     Err(e) => {
                                         println!("failed to parse message date: {:?}", e);
                                         chrono::Local::now()
                                     }
                                 },
+
                                 None => chrono::Local::now(),
                             };
 
@@ -281,12 +299,18 @@ fn main() {
                         }
                     };
 
+                    let starttls = match t.get("starttls").and_then(|b| b.as_bool()) {
+                        None => false,
+                        Some(b) => b,
+                    };
+
                     Some(Account {
                         name: name.as_str().to_owned(),
                         server: (
                             t["server"].as_str().unwrap().to_owned(),
                             t["port"].as_integer().unwrap() as u16,
                         ),
+                        starttls,
                         username: t["username"].as_str().unwrap().to_owned(),
                         password,
                         notification_command: t
